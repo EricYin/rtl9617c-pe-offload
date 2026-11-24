@@ -1,2 +1,8 @@
 firmware/*.o
 firmware/*.elf
+kmod/*.o
+kmod/*.ko
+kmod/*.mod*
+kmod/.*.cmd
+kmod/modules.order
+kmod/Module.symvers
