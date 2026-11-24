@@ -9,7 +9,7 @@
 
 #include "rtl9617c-pe-abi.h"
 
-#define PE_FW_VERSION		0x00010000U	/* v1.0.0 */
+#define PE_FW_VERSION		0x00010001U	/* v1.0.1 */
 #define PE_LOG_MASK		(RTL_PE_LOG_SIZE - 1U)
 /*
  * Realtek Taroko RX5281 (PrId 0xdc02) omits standard MIPS32 CP0 $9 Count.
@@ -20,10 +20,18 @@
 #define PE_PTP_NS_MASK		0x3fffffffU
 #define PE_NS_PER_SEC		1000000000U
 #define PE_WIN_TARGET_NS	200000000U	/* 200 ms sampling window */
+#define PE_IDLE_PAUSE_ITERS	2000U		/* ~5 us pure-IMEM backoff */
+#define PE_PTP_POLL_DIV		200U		/* ~1 ms NE APB read cadence */
 
 static inline void pe_sync(void)
 {
 	__asm__ volatile(".word 0x0000000f" ::: "memory");
+}
+
+static inline void pe_idle_pause(u32 iters)
+{
+	while (iters--)
+		__asm__ volatile("nop");
 }
 
 static inline u32 read_hw_ns(void)
@@ -143,6 +151,7 @@ pe_main(volatile struct rtl_pe_shm *shm)
 	u32 win_busy = 0;
 	u32 feat_busy[RTL_PE_FEAT_MAX];
 	u32 fallback_loops = 0;
+	u32 idle_ticks = 0;
 	u32 i;
 
 	for (i = 0; i < RTL_PE_FEAT_MAX; i++) {
@@ -185,6 +194,8 @@ pe_main(volatile struct rtl_pe_shm *shm)
 	prev_ns = win_start;
 
 	for (;;) {
+		u32 did_work = 0;
+
 		/* 1. Handle clean stop request from host */
 		if (shm->stop_req) {
 			log_puts(shm, ring, "PE");
@@ -217,6 +228,7 @@ pe_main(volatile struct rtl_pe_shm *shm)
 			last_cmd_seq = new_seq;
 			shm->ack_seq = new_seq;
 			pe_sync();
+			did_work = 1;
 
 			log_puts(shm, ring, "PE");
 			log_u32(shm, ring, shm->core_id);
@@ -249,28 +261,41 @@ pe_main(volatile struct rtl_pe_shm *shm)
 			shm->test_ack_seq = tseq;
 			last_test_seq = tseq;
 			pe_sync();
+			did_work = 1;
 		}
 
-		/* 4. Poll active non-exclusive offload feature slots */
+		/* 4. Poll active non-exclusive offload feature slots (no idle NE MMIO) */
 		if (feature_mask) {
 			for (i = 0; i < RTL_PE_FEAT_MAX; i++) {
+				u32 done;
+
 				if (!(feature_mask & (1U << i)))
 					continue;
-				u32 t0 = read_hw_ns();
-				u32 done = poll_feature_slot(shm, i);
-
+				done = poll_feature_slot(shm, i);
 				if (done) {
-					u32 dt = delta_hw_ns(read_hw_ns(), t0);
-					feat_busy[i] += dt;
-					win_busy += dt;
+					did_work = 1;
+					feat_busy[i] += done;
+					win_busy += done;
 				}
 			}
 		}
 
-		/* 5. Publish 200 ms telemetry window + watchdog heartbeat */
+		/*
+		 * 5. Pure-IMEM idle backoff so PE never floods the shared DDR AXI
+		 *    or Network Engine (0xf4300000) APB register bus when idle.
+		 *    Sample the NE PTP timer at ~1 ms cadence rather than every loop.
+		 */
+		if (!did_work) {
+			pe_idle_pause(PE_IDLE_PAUSE_ITERS);
+			if (++idle_ticks < PE_PTP_POLL_DIV)
+				continue;
+			idle_ticks = 0;
+		}
+
+		/* 6. Publish 200 ms telemetry window + watchdog heartbeat */
 		now_ns = read_hw_ns();
 		if (now_ns == prev_ns) {
-			if (++fallback_loops >= 1500000U) {
+			if (++fallback_loops >= 200U) {
 				shm->heartbeat = shm->heartbeat + 1U;
 				shm->uptime_ms = shm->uptime_ms + 200U;
 				shm->count_now = now_ns;
