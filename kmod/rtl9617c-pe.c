@@ -23,7 +23,12 @@
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
 #include <linux/unaligned.h>
+#else
+#include <asm/unaligned.h>
+#endif
 #include <linux/workqueue.h>
 
 #include <linux/soc/realtek/rtl9617c-pe-abi.h>
@@ -1087,7 +1092,11 @@ MODULE_DEVICE_TABLE(of, rtl_pe_of_match);
 
 static struct platform_driver rtl_pe_driver = {
 	.probe = rtl_pe_probe,
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
 	.remove = rtl_pe_remove,
+#else
+	.remove_new = rtl_pe_remove,
+#endif
 	.shutdown = rtl_pe_shutdown,
 	.driver = {
 		.name = "rtl9617c-pe",

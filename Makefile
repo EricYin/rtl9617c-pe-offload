@@ -2,7 +2,7 @@ include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/kernel.mk
 
 PKG_NAME:=rtl9617c-pe-offload
-PKG_VERSION:=1.0.0
+PKG_VERSION:=1.0.1
 PKG_RELEASE:=1
 PKG_LICENSE:=GPL-2.0-only
 
@@ -14,6 +14,7 @@ define KernelPackage/rtl9617c-pe
   DEPENDS:=@TARGET_rtl9617c
   FILES:=$(PKG_BUILD_DIR)/kmod/rtl9617c-pe.ko
   AUTOLOAD:=$(call AutoLoad,60,rtl9617c-pe)
+  KCONFIG:=
 endef
 
 define KernelPackage/rtl9617c-pe/description
@@ -26,7 +27,7 @@ define Package/rtl9617c-pe-offload
   SECTION:=net
   CATEGORY:=Network
   TITLE:=RTL9617C Taroko MIPS-I PE bare-metal offload firmware and manager
-  DEPENDS:=@TARGET_rtl9617c +kmod-rtl9617c-pe +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus +rpcd
+  DEPENDS:=@TARGET_rtl9617c +kmod-rtl9617c-pe +ucode +ucode-mod-fs +ucode-mod-uci +ucode-mod-ubus +rpcd +rpcd-mod-ucode
 endef
 
 define Package/rtl9617c-pe-offload/description
@@ -48,12 +49,11 @@ endef
 
 define Build/Compile
 	+$(KERNEL_MAKE) M="$(PKG_BUILD_DIR)/kmod" modules
-	if command -v clang >/dev/null 2>&1 \
-	   && (command -v ld.lld-18 >/dev/null 2>&1 || command -v ld.lld >/dev/null 2>&1) \
-	   && (command -v llvm-objcopy-18 >/dev/null 2>&1 || command -v llvm-objcopy >/dev/null 2>&1) \
-	   && (command -v llvm-objdump-18 >/dev/null 2>&1 || command -v llvm-objdump >/dev/null 2>&1); then \
-		env -u CFLAGS -u ASFLAGS -u LDFLAGS -u MAKEFLAGS $(MAKE) -C $(PKG_BUILD_DIR)/firmware clean && \
-		env -u CFLAGS -u ASFLAGS -u LDFLAGS -u MAKEFLAGS $(MAKE) -C $(PKG_BUILD_DIR)/firmware all; \
+	@if [ "$(RTL9617C_PE_REBUILD_FW)" = "1" ]; then \
+		rm -rf $(PKG_BUILD_DIR)/firmware.build && \
+		$(CP) $(PKG_BUILD_DIR)/firmware $(PKG_BUILD_DIR)/firmware.build && \
+		env -u CFLAGS -u ASFLAGS -u LDFLAGS -u MAKEFLAGS $(MAKE) -C $(PKG_BUILD_DIR)/firmware.build clean all && \
+		$(CP) $(PKG_BUILD_DIR)/firmware.build/pe-offload.bin $(PKG_BUILD_DIR)/firmware/pe-offload.bin; \
 	else \
 		test -f $(PKG_BUILD_DIR)/firmware/pe-offload.bin; \
 	fi
