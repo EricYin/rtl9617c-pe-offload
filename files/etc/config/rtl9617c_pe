@@ -1,0 +1,18 @@
+config global 'global'
+	option mode 'offload'
+
+config feature 'fq_codel'
+	option enabled '0'
+	option pe '0'
+
+config feature 'ipsec'
+	option enabled '0'
+	option pe '0'
+
+config feature 'srv6'
+	option enabled '0'
+	option pe '1'
+
+config feature 'mcast'
+	option enabled '0'
+	option pe '1'

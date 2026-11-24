@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+START=92
+STOP=10
+
+start() {
+	[ -d /sys/kernel/rtl9617c_pe ] || return 0
+	/usr/sbin/rtl9617c-pe-ctl apply
+}
+
+stop() {
+	[ -d /sys/kernel/rtl9617c_pe ] || return 0
+	for c in 0 1; do
+		[ -w "/sys/kernel/rtl9617c_pe/pe${c}/enable" ] && echo 0 > "/sys/kernel/rtl9617c_pe/pe${c}/enable" 2>/dev/null || true
+	done
+}
+
+reload_service() {
+	start
+}

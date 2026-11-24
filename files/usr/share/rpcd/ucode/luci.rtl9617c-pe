@@ -1,0 +1,50 @@
+#!/usr/bin/env ucode
+'use strict';
+
+import * as pe from 'rtl9617c.pe';
+
+return {
+	'luci.rtl9617c-pe': {
+		status: {
+			call: function() {
+				return pe.status();
+			}
+		},
+		set_mode: {
+			args: { mode: 'offload' },
+			call: function(req) {
+				return pe.set_mode(req.args.mode);
+			}
+		},
+		set_feature: {
+			args: { id: 'fq_codel', enabled: true, pe: 0 },
+			call: function(req) {
+				let p = ('pe' in req.args) ? req.args.pe : null;
+				return pe.set_feature(req.args.id, req.args.enabled, p);
+			}
+		},
+		disable_feature: {
+			args: { id: 'fq_codel' },
+			call: function(req) {
+				return pe.set_feature(req.args.id, false, null);
+			}
+		},
+		disable_all: {
+			call: function() {
+				return pe.disable_all();
+			}
+		},
+		selftest: {
+			args: { core: 0, iter: 5000 },
+			call: function(req) {
+				return pe.run_selftest(req.args.core, req.args.iter);
+			}
+		},
+		get_log: {
+			args: { core: 0 },
+			call: function(req) {
+				return pe.get_log(req.args.core);
+			}
+		}
+	}
+};

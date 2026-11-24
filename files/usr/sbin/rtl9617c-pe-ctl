@@ -1,0 +1,41 @@
+#!/usr/bin/env ucode
+'use strict';
+
+import * as pe from 'rtl9617c.pe';
+
+let cmd = ARGV[0] || 'status';
+let res;
+
+switch (cmd) {
+case 'status':
+	res = pe.status();
+	break;
+case 'apply':
+	res = pe.apply();
+	break;
+case 'set_mode':
+	res = pe.set_mode(ARGV[1]);
+	break;
+case 'set_feature':
+	res = pe.set_feature(ARGV[1], ARGV[2] == '1' || ARGV[2] == 'true', ARGV[3]);
+	break;
+case 'disable_feature':
+	res = pe.set_feature(ARGV[1], false, null);
+	break;
+case 'disable_all':
+	res = pe.disable_all();
+	break;
+case 'selftest':
+	res = pe.run_selftest(ARGV[1] ?? 0, ARGV[2] ?? 5000);
+	break;
+case 'log':
+	res = pe.get_log(ARGV[1] ?? 0);
+	print(res.log);
+	exit(0);
+default:
+	warn('Usage: rtl9617c-pe-ctl <status|apply|set_mode|set_feature|disable_feature|disable_all|selftest|log>\n');
+	exit(1);
+}
+
+print(sprintf('%J\n', res));
+exit(res && res.ok === false ? 1 : 0);

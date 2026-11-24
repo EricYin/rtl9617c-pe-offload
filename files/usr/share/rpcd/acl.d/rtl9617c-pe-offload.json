@@ -1,0 +1,17 @@
+{
+	"rtl9617c-pe-offload": {
+		"description": "RTL9617C PE coprocessor telemetry and control",
+		"read": {
+			"ubus": {
+				"luci.rtl9617c-pe": [ "status", "get_log" ]
+			},
+			"uci": [ "rtl9617c_pe" ]
+		},
+		"write": {
+			"ubus": {
+				"luci.rtl9617c-pe": [ "set_mode", "set_feature", "disable_feature", "disable_all", "selftest" ]
+			},
+			"uci": [ "rtl9617c_pe" ]
+		}
+	}
+}
