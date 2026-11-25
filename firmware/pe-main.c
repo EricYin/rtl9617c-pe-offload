@@ -1022,6 +1022,12 @@ pe_main(volatile struct rtl_pe_shm *shm)
 	u32 i;
 
 	dp_init(&dp);
+	if (vp_ready && vp_va) {
+		u32 hw_rd = pe_rd32(vp_va + PE_DMA_VP_READ_OFF) & RTL_PE_DMA_MASK;
+
+		dp.dma_head = hw_rd;
+		dp.dma_tail = hw_rd;
+	}
 
 	fq_target_ns = (shm->fq_target_us ? shm->fq_target_us : 5000U) * 1000U;
 	fq_interval_ns = (shm->fq_interval_us ? shm->fq_interval_us : 100000U) * 1000U;
@@ -1065,8 +1071,8 @@ pe_main(volatile struct rtl_pe_shm *shm)
 	shm->util_permille = 0;
 	shm->tx_cons = 0;
 	shm->free_prod = 0;
-	shm->dma_tx_head = 0;
-	shm->dma_tx_tail = 0;
+	shm->dma_tx_head = dp.dma_head;
+	shm->dma_tx_tail = dp.dma_tail;
 	shm->state = 1; /* running */
 	pe_sync();
 
@@ -1081,6 +1087,8 @@ pe_main(volatile struct rtl_pe_shm *shm)
 	log_puts(shm, ring, " vp=");
 	log_u32(shm, ring, vp_id);
 	if (vp_ready && vp_va) {
+		log_puts(shm, ring, " rd=");
+		log_u32(shm, ring, dp.dma_head);
 		log_puts(shm, ring, " dmactrl=");
 		log_hex32(shm, ring, pe_rd32(PE_DMA_BASE_VA + PE_DMA_CTRL_OFF));
 	}
@@ -1099,7 +1107,7 @@ pe_main(volatile struct rtl_pe_shm *shm)
 		/* 1. Handle clean stop request from host */
 		if (shm->stop_req) {
 			if (vp_ready && vp_va) {
-				u32 wait_it = 2000U;
+				u32 wait_it = 10000U;
 
 				while (wait_it--) {
 					u32 hw = pe_rd32(vp_va + PE_DMA_VP_READ_OFF) & RTL_PE_DMA_MASK;
@@ -1177,12 +1185,26 @@ pe_main(volatile struct rtl_pe_shm *shm)
 		if (shm->dp_seq != last_dp_seq) {
 			u32 new_dp = shm->dp_seq;
 
-			dp_reset_queues(shm, free_ring, &dp, 0);
 			vp_id = shm->dma_vp_id;
 			vp_ready = shm->dma_vp_ready;
 			vp_va = (vp_id < 12U) ? PE_DMA_VP_BASE(vp_id) : 0U;
 			pool_dma = shm->pool_dma;
 			pool_va = pool_dma ? (PE_POOL_KSEG1_BASE | (pool_dma & 0xfffffU)) : 0U;
+
+			/* Host already reset tx_prod/free_cons and freed in-flight slots. */
+			dp_init(&dp);
+			if (vp_ready && vp_va) {
+				u32 hw_rd = pe_rd32(vp_va + PE_DMA_VP_READ_OFF) & RTL_PE_DMA_MASK;
+
+				dp.dma_head = hw_rd;
+				dp.dma_tail = hw_rd;
+			}
+			shm->tx_cons = 0;
+			shm->free_prod = 0;
+			shm->dma_tx_head = dp.dma_head;
+			shm->dma_tx_tail = dp.dma_tail;
+			shm->feat[RTL_PE_FEAT_FQ_CODEL_BIT].qdepth = 0;
+			shm->feat[RTL_PE_FEAT_MCAST_BIT].qdepth = 0;
 			refresh_feature_flags(shm, feature_mask, vp_ready && vp_va && pool_va);
 
 			last_dp_seq = new_dp;
@@ -1197,6 +1219,8 @@ pe_main(volatile struct rtl_pe_shm *shm)
 			log_puts(shm, ring, " ready=");
 			log_u32(shm, ring, vp_ready);
 			if (vp_ready && vp_va) {
+				log_puts(shm, ring, " rd=");
+				log_u32(shm, ring, dp.dma_head);
 				log_puts(shm, ring, " dmactrl=");
 				log_hex32(shm, ring, pe_rd32(PE_DMA_BASE_VA + PE_DMA_CTRL_OFF));
 			}

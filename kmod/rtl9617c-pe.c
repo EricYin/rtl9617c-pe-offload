@@ -145,6 +145,7 @@ struct rtl_pe_core {
 	bool dp_timer_armed;
 	bool dma_vp_ready;
 	u32 dma_vp_id;
+	u32 dma_vp_rd_init;
 	u32 tx_prod;
 	u32 free_cons;
 	struct sk_buff *slot_skb[RTL_PE_POOL_SLOTS];
@@ -416,10 +417,11 @@ static bool rtl_pe_dma_vp_arm_locked(struct rtl_pe_core *pe)
 	void __iomem *vp;
 	dma_addr_t desc_dma;
 	u32 vp_id = TAURUS_DMA_VP_PE(pe->id);
-	u32 val;
+	u32 val, rd;
 	int ret;
 
 	pe->dma_vp_id = vp_id;
+	pe->dma_vp_rd_init = 0;
 	pe->dma_vp_ready = false;
 
 	if (!dma || !pe->mem || !pe->pool || pe->mode != RTL_PE_MODE_OFFLOAD)
@@ -432,7 +434,8 @@ static bool rtl_pe_dma_vp_arm_locked(struct rtl_pe_core *pe)
 
 	writel(0, vp + TAURUS_DMA_VP_ENABLE);
 	writel(0, vp + TAURUS_DMA_VP_IRQ_ENABLE);
-	writel(0, vp + TAURUS_DMA_VP_WRITE);
+	writel(readl(dma + TAURUS_DMA_SS_CTRL) & ~BIT(vp_id),
+	       dma + TAURUS_DMA_SS_CTRL);
 	memset(pe_dma_ring(pe), 0,
 	       RTL_PE_DMA_ENTRIES * sizeof(struct rtl_pe_dma_desc));
 	dma_wmb();
@@ -451,10 +454,22 @@ static bool rtl_pe_dma_vp_arm_locked(struct rtl_pe_core *pe)
 		return false;
 	}
 
+	/*
+	 * Taurus DMA_LSO VP_READ is hardware read-only and only resets to 0 on
+	 * a global DMA_CTRL_RESET (not on per-VP disable or BASE_ACCESS).
+	 * Sync VP_WRITE to the live VP_READ cursor before enabling the VP,
+	 * otherwise DMA_LSO immediately fetches zeroed descriptors and wedges
+	 * TX across all VPs when re-enabling a PE after power-saving stop.
+	 */
+	rd = readl(vp + TAURUS_DMA_VP_READ) & RTL_PE_DMA_MASK;
+	writel(rd, vp + TAURUS_DMA_VP_WRITE);
+	readl(vp + TAURUS_DMA_VP_WRITE);
+
 	writel(TAURUS_DMA_VP_HEADER_A_VAL, vp + TAURUS_DMA_VP_HEADER_A);
 	writel(TAURUS_DMA_VP_ENABLE_ALL, vp + TAURUS_DMA_VP_ENABLE);
 	writel(readl(dma + TAURUS_DMA_SS_CTRL) | TAURUS_DMA_SS_CTRL_EN | BIT(vp_id),
 	       dma + TAURUS_DMA_SS_CTRL);
+	pe->dma_vp_rd_init = rd;
 	pe->dma_vp_ready = true;
 	return true;
 }
@@ -474,10 +489,15 @@ static void rtl_pe_dma_vp_disarm_locked(struct rtl_pe_core *pe)
 	pe->dma_vp_ready = false;
 	vp = dma + TAURUS_DMA_VP(vp_id);
 	wr = readl(vp + TAURUS_DMA_VP_WRITE) & RTL_PE_DMA_MASK;
-	readl_poll_timeout(vp + TAURUS_DMA_VP_READ, rd,
-			   (rd & RTL_PE_DMA_MASK) == wr, 50, 10000);
+	if (readl_poll_timeout(vp + TAURUS_DMA_VP_READ, rd,
+			       (rd & RTL_PE_DMA_MASK) == wr, 50, 50000))
+		dev_warn(pe->ctrl->dev,
+			 "pe%u DMA VP%u drain timeout (wr=%u rd=0x%x)\n",
+			 pe->id, vp_id, wr, rd);
 
 	writel(0, vp + TAURUS_DMA_VP_ENABLE);
+	writel(readl(dma + TAURUS_DMA_SS_CTRL) & ~BIT(vp_id),
+	       dma + TAURUS_DMA_SS_CTRL);
 }
 
 static void rtl_pe_update_routes_locked(struct rtl_pe_ctrl *ctrl)
@@ -946,11 +966,11 @@ static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 	rtl_pe_update_routes_locked(pe->ctrl);
 
 	dev_info(pe->ctrl->dev,
-		 "pe%u online: fw=%s prid=0x%08x clk=%u MHz axi=%u MHz dma=%pad pool=%pad vp=%u(%s) mask=0x%x\n",
+		 "pe%u online: fw=%s prid=0x%08x clk=%u MHz axi=%u MHz dma=%pad pool=%pad vp=%u(%s,rd=%u) mask=0x%x\n",
 		 pe->id, pe->fw_name, READ_ONCE(shm->cp0_prid),
 		 pe_hz / 1000000U, peaxi_hz / 1000000U, &pe->dma, &pe->pool_dma,
 		 pe->dma_vp_id, pe->dma_vp_ready ? "ready" : "wait-ni",
-		 pe->feature_mask);
+		 pe->dma_vp_rd_init, pe->feature_mask);
 
 	schedule_delayed_work(&pe->ctrl->wdt_work,
 			      msecs_to_jiffies(RTL_PE_WDT_INTERVAL_MS));
