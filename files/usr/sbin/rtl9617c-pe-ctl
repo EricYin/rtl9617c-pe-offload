@@ -19,6 +19,16 @@ case 'set_mode':
 case 'set_feature':
 	res = pe.set_feature(ARGV[1], ARGV[2] == '1' || ARGV[2] == 'true', ARGV[3]);
 	break;
+case 'set_params': {
+	let p = {};
+	for (let i = 1; i < length(ARGV); i++) {
+		let m = match(ARGV[i], /^([a-z0-9_]+)=([0-9]+)$/);
+		if (m)
+			p[m[1]] = int(m[2]);
+	}
+	res = pe.set_params(p);
+	break;
+}
 case 'disable_feature':
 	res = pe.set_feature(ARGV[1], false, null);
 	break;
@@ -33,7 +43,7 @@ case 'log':
 	print(res.log);
 	exit(0);
 default:
-	warn('Usage: rtl9617c-pe-ctl <status|apply|set_mode|set_feature|disable_feature|disable_all|selftest|log>\n');
+	warn('Usage: rtl9617c-pe-ctl <status|apply|set_mode|set_feature|set_params|disable_feature|disable_all|selftest|log>\n');
 	exit(1);
 }
 

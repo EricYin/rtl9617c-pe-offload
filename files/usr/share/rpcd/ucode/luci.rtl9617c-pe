@@ -23,6 +23,20 @@ return {
 				return pe.set_feature(req.args.id, req.args.enabled, p);
 			}
 		},
+		set_params: {
+			args: {
+				fq_rate_kbps: 0,
+				fq_target_us: 5000,
+				fq_interval_us: 100000,
+				fq_quantum: 1514,
+				fq_limit: 224,
+				fq_ecn: 1,
+				mcast_rate_kbps: 0
+			},
+			call: function(req) {
+				return pe.set_params(req.args);
+			}
+		},
 		disable_feature: {
 			args: { id: 'fq_codel' },
 			call: function(req) {

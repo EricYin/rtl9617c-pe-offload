@@ -13,43 +13,66 @@ export const FEATURES = [
 		id: 'fq_codel',
 		bit: 0,
 		name: 'FQ-CoDel 硬件公平队列',
-		desc: '在 PE 旁路运行轻量级公平队列，消除 2.5G 满载下的缓冲膨胀（Bufferbloat）',
+		desc: '在 PE 旁路运行 64 队列 FQ-CoDel（支持 1ns PTP 定时整形与 ECN 标记），消除上行/代理路径缓冲膨胀',
 		module_title: '网口总限速与排队',
 		module_url: 'admin/network/rtl9617c_qos/ports',
 		default_pe: 0,
-		note: '非独占，可与其他有线卸载同核共存'
+		hw_capable: true,
+		note: '已接入 NI TX 钩子与 DMA LSO VP 直发引擎，可与其他有线卸载同核共存'
 	},
 	{
 		id: 'ipsec',
 		bit: 1,
-		name: 'IPsec ESP 硬件卸载',
-		desc: '由 PE 拆封 ESP 并驱动 Taurus 硬件密码引擎，绕过 A55 协议栈开销',
+		name: 'IPsec ESP 卸载框架',
+		desc: '框架保留；当前 0x90500000 密码引擎由内核 rtk-taurus-crypto 管理，加解密由 ARMv8 AES-CE 承担',
 		module_title: 'VPN 硬件加速',
 		module_url: 'admin/network/rtl9617c_vpn',
 		default_pe: 0,
-		note: '非独占 PE 核；启用时接管 0x90500000 密码引擎（A55 自动使用 ARMv8 AES-CE）'
+		hw_capable: false,
+		note: '仅状态占位（实机密码由内核 ARMv8 AES-CE 执行，未绑定 PE DMA TX 路径）'
 	},
 	{
 		id: 'srv6',
 		bit: 2,
-		name: 'SRv6 / 变长隧道头卸载',
-		desc: '处理 FE 硬件双头表无法容纳的变长 SRH 及扩展封装头',
+		name: 'SRv6 / 变长隧道头框架',
+		desc: '框架保留；当前变长 SRv6 封装由内核网络栈与 FE 表项协同承担',
 		module_title: 'VPN 硬件加速',
 		module_url: 'admin/network/rtl9617c_vpn',
 		default_pe: 1,
-		note: '非独占，轻量改头开销极低'
+		hw_capable: false,
+		note: '仅状态占位（当前未绑定 PE DMA TX 路径）'
 	},
 	{
 		id: 'mcast',
 		bit: 3,
-		name: '组播队列辅助卸载',
-		desc: '辅助处理高并发组播复制与端口排队，降低 A55 软中断抖动',
+		name: '组播队列硬件直发',
+		desc: '接管主机侧发送的组播/广播报文，经 PE 与独立 DMA LSO VP 发送并支持可选速率平滑',
 		module_title: '硬件加速与卸载',
 		module_url: 'admin/network/rtl9617c_offload',
 		default_pe: 1,
-		note: '非独占，可与其他有线卸载同核共存'
+		hw_capable: true,
+		note: '已接入 NI TX 钩子与 DMA LSO VP 直发引擎，可与其他有线卸载同核共存'
 	}
 ];
+
+const PARAM_DEFAULTS = {
+	fq_rate_kbps:    { sec: 'fq_codel', opt: 'rate_kbps',   def: 0,      min: 0,    max: 10000000 },
+	fq_target_us:    { sec: 'fq_codel', opt: 'target_us',   def: 5000,   min: 100,  max: 100000 },
+	fq_interval_us:  { sec: 'fq_codel', opt: 'interval_us', def: 100000, min: 1000, max: 400000 },
+	fq_quantum:      { sec: 'fq_codel', opt: 'quantum',     def: 1514,   min: 256,  max: 9000 },
+	fq_limit:        { sec: 'fq_codel', opt: 'limit',       def: 224,    min: 16,   max: 224 },
+	fq_ecn:          { sec: 'fq_codel', opt: 'ecn',         def: 1,      min: 0,    max: 1 },
+	mcast_rate_kbps: { sec: 'mcast',    opt: 'rate_kbps',   def: 0,      min: 0,    max: 10000000 }
+};
+
+function clamp_int(v, spec) {
+	let n = int(v);
+	if (n < spec.min)
+		return spec.min;
+	if (n > spec.max)
+		return spec.max;
+	return n;
+}
 
 function is_dir(path) {
 	let st = fs.stat(path);
@@ -109,7 +132,13 @@ function load_cfg() {
 			pe: pe
 		};
 	}
-	return { mode: mode, features: feat_cfg };
+
+	let params = {};
+	for (let k, spec in PARAM_DEFAULTS) {
+		let raw = cur.get('rtl9617c_pe', spec.sec, spec.opt);
+		params[k] = clamp_int(raw != null ? raw : spec.def, spec);
+	}
+	return { mode: mode, features: feat_cfg, params: params };
 }
 
 function save_cfg(cfg) {
@@ -124,6 +153,17 @@ function save_cfg(cfg) {
 			cur.set('rtl9617c_pe', f.id, 'feature');
 		cur.set('rtl9617c_pe', f.id, 'enabled', fc.enabled ? '1' : '0');
 		cur.set('rtl9617c_pe', f.id, 'pe', sprintf('%d', fc.pe));
+	}
+
+	if (cfg.params) {
+		for (let k, spec in PARAM_DEFAULTS) {
+			if (!(k in cfg.params))
+				continue;
+			if (!cur.get('rtl9617c_pe', spec.sec))
+				cur.set('rtl9617c_pe', spec.sec, 'feature');
+			cur.set('rtl9617c_pe', spec.sec, spec.opt,
+				sprintf('%d', clamp_int(cfg.params[k], spec)));
+		}
 	}
 	cur.commit('rtl9617c_pe');
 }
@@ -148,6 +188,19 @@ function parse_stats(core_id) {
 		exc_epc: '0x00000000',
 		test_crc: '0x00000000',
 		test_cycles: 0,
+		dma_vp_id: 255,
+		dma_vp_ready: 0,
+		dma_tx_head: 0,
+		dma_tx_tail: 0,
+		dp_enq: 0,
+		dp_bypass: 0,
+		fq_rate_kbps: 0,
+		fq_target_us: 5000,
+		fq_interval_us: 100000,
+		fq_quantum: 1514,
+		fq_limit: 224,
+		fq_ecn: 1,
+		mcast_rate_kbps: 0,
 		feat_stats: {}
 	};
 	if (!raw)
@@ -167,13 +220,17 @@ function parse_stats(core_id) {
 			let fm = match(k, /^feat([0-9]+)$/);
 			let p = split(v, ' ');
 			if (length(p) >= 6) {
+				let fl = hex(p[5]);
 				out.feat_stats[int(fm[1])] = {
 					util_permille: int(p[0]),
 					cycles: int(p[1]),
 					packets: int(p[2]),
 					bytes: int(p[3]),
 					qdepth: int(p[4]),
-					flags: hex(p[5])
+					flags: fl,
+					hw_bound: (fl & 2) != 0,
+					drops: length(p) >= 7 ? int(p[6]) : 0,
+					ecn_marks: length(p) >= 8 ? int(p[7]) : 0
 				};
 			}
 		} else if (k in out) {
@@ -239,6 +296,8 @@ export function apply() {
 
 			write_str(sprintf('%s/pe%d/firmware', SYS_ROOT, c), FW_OFFLOAD);
 			write_str(sprintf('%s/pe%d/mode', SYS_ROOT, c), 'offload');
+			for (let pk, _spec in PARAM_DEFAULTS)
+				write_str(sprintf('%s/pe%d/%s', SYS_ROOT, c, pk), sprintf('%d', cfg.params[pk]));
 			write_str(sprintf('%s/pe%d/feature_mask', SYS_ROOT, c), sprintf('0x%x', m));
 			if (cur_state != 'running' || cur_fw != FW_OFFLOAD) {
 				if (!write_str(sprintf('%s/pe%d/enable', SYS_ROOT, c), '1'))
@@ -247,7 +306,7 @@ export function apply() {
 		}
 	}
 
-	return { ok: true, mode: 'offload', masks: masks };
+	return { ok: true, mode: 'offload', masks: masks, params: cfg.params };
 }
 
 export function status() {
@@ -264,7 +323,8 @@ export function status() {
 		let fc = cfg.features[f.id] || { enabled: false, pe: f.default_pe };
 		let core = cores[fc.pe];
 		let fs_hw = core.feat_stats[f.bit] || {
-			util_permille: 0, cycles: 0, packets: 0, bytes: 0, qdepth: 0, flags: 0
+			util_permille: 0, cycles: 0, packets: 0, bytes: 0,
+			qdepth: 0, flags: 0, hw_bound: false, drops: 0, ecn_marks: 0
 		};
 		let active = (cfg.mode == 'offload') && fc.enabled &&
 			     (core.state == 'running') && ((core.feature_mask & (1 << f.bit)) != 0);
@@ -277,13 +337,17 @@ export function status() {
 			note: f.note,
 			module_title: f.module_title,
 			module_url: f.module_url,
+			hw_capable: !!f.hw_capable,
+			hw_bound: active && !!fs_hw.hw_bound,
 			enabled: fc.enabled,
 			active: active,
 			pe: fc.pe,
 			util_permille: active ? fs_hw.util_permille : 0,
 			packets: active ? fs_hw.packets : 0,
 			bytes: active ? fs_hw.bytes : 0,
-			qdepth: active ? fs_hw.qdepth : 0
+			qdepth: active ? fs_hw.qdepth : 0,
+			drops: active ? fs_hw.drops : 0,
+			ecn_marks: active ? fs_hw.ecn_marks : 0
 		});
 	}
 
@@ -297,6 +361,7 @@ export function status() {
 		pe_clk_hz: pe_clk_hz,
 		peaxi_clk_hz: peaxi_clk_hz,
 		mode: cfg.mode,
+		params: cfg.params,
 		wireless: wifi,
 		cores: cores,
 		features: feat_list
@@ -337,6 +402,25 @@ export function set_feature(id, enabled, pe) {
 	cfg.features[f.id].enabled = en;
 	if (en && cfg.mode != 'offload')
 		cfg.mode = 'offload';
+
+	save_cfg(cfg);
+	return apply();
+}
+
+export function set_params(params) {
+	let cfg = load_cfg();
+	let changed = false;
+
+	if (params) {
+		for (let k, spec in PARAM_DEFAULTS) {
+			if (k in params && params[k] != null) {
+				cfg.params[k] = clamp_int(params[k], spec);
+				changed = true;
+			}
+		}
+	}
+	if (!changed)
+		return { ok: false, error: 'no valid parameters provided' };
 
 	save_cfg(cfg);
 	return apply();

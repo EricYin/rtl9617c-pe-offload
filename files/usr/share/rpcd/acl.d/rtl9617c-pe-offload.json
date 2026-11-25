@@ -9,7 +9,7 @@
 		},
 		"write": {
 			"ubus": {
-				"luci.rtl9617c-pe": [ "set_mode", "set_feature", "disable_feature", "disable_all", "selftest" ]
+				"luci.rtl9617c-pe": [ "set_mode", "set_feature", "set_params", "disable_feature", "disable_all", "selftest" ]
 			},
 			"uci": [ "rtl9617c_pe" ]
 		}

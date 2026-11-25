@@ -10,17 +10,24 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
+#include <linux/etherdevice.h>
 #include <linux/firmware.h>
+#include <linux/hrtimer.h>
+#include <linux/if_ether.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kobject.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/netdevice.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/rcupdate.h>
 #include <linux/reboot.h>
 #include <linux/sizes.h>
+#include <linux/skbuff.h>
 #include <linux/slab.h>
+#include <linux/spinlock.h>
 #include <linux/string.h>
 #include <linux/sysfs.h>
 #include <linux/version.h>
@@ -32,6 +39,7 @@
 #include <linux/workqueue.h>
 
 #include <linux/soc/realtek/rtl9617c-pe-abi.h>
+#include "rtl9617c_ni.h"
 
 #define RTL_PE_NUM_CORES		2
 #define RTL_PE_DEFAULT_FW		"rtl9617c/pe-offload.bin"
@@ -47,6 +55,33 @@
 #define TAURUS_GLB_PEDIV_OFF		0x210
 #define TAURUS_GLB_CPLL0_OFF		0x230
 #define TAURUS_GLB_FPLL0_OFF		0x240
+
+#define TAURUS_DMA_LSO_BASE		0x4f7001000ULL
+#define TAURUS_DMA_LSO_SIZE		0x1000UL
+#define TAURUS_DMA_CTRL			0x000
+#define TAURUS_DMA_CTRL_ENABLE		BIT(0)
+#define TAURUS_DMA_VP(n)		(0x100 + (n) * 0xa0)
+#define TAURUS_DMA_VP_ENABLE		0x00
+#define TAURUS_DMA_VP_ENABLE_ALL	0xffU
+#define TAURUS_DMA_VP_BASE_ACCESS	0x04
+#define TAURUS_DMA_VP_BASE_ACCESS_BUSY	BIT(31)
+#define TAURUS_DMA_VP_BASE_ACCESS_WRITE	BIT(30)
+#define TAURUS_DMA_VP_BASE_HIGH		0x08
+#define TAURUS_DMA_VP_BASE_HIGH_INIT	2U
+#define TAURUS_DMA_VP_BASE_LOW		0x0c
+#define TAURUS_DMA_VP_WRITE		0x18
+#define TAURUS_DMA_VP_READ		0x1c
+#define TAURUS_DMA_VP_IRQ_ENABLE	0x64
+#define TAURUS_DMA_VP_HEADER_A		0x78
+#define TAURUS_DMA_VP_HEADER_A_VAL	((16U << 3) | BIT(9))
+#define TAURUS_DMA_SS_CTRL		0x900
+#define TAURUS_DMA_SS_CTRL_EN		BIT(31)
+
+#define TAURUS_DMA_DESC_CTRL		0x61000002U
+#define TAURUS_DMA_DESC_CTRL_OAM	0x61000000U
+#define TAURUS_DMA_VP_PE(c)		(4U + (c))
+#define TAURUS_NI_HDR_PKT_SIZE_MASK	0x1fff8000U
+#define TAURUS_NI_HDR_OAM_LDPID		15U
 
 #define TAURUS_ATU0_BASE		0x90300000UL
 #define TAURUS_ATU_STRIDE		0x100UL
@@ -79,6 +114,8 @@ struct rtl_pe_core {
 
 	void *mem;
 	dma_addr_t dma;
+	void *pool;
+	dma_addr_t pool_dma;
 	bool hw_saved;
 	bool configured;
 	bool clk_gated;
@@ -93,17 +130,43 @@ struct rtl_pe_core {
 	u32 mode;
 	u32 feature_mask;
 	u32 cmd_seq;
+	u32 dp_seq;
 	u32 test_seq;
 	u32 last_hb;
 	unsigned int hb_stalls;
 	u32 last_exc_cause;
 	u32 last_exc_epc;
 	char fw_name[96];
+
+	/* Data-plane TX hook state protected by dp_lock */
+	spinlock_t dp_lock;
+	struct hrtimer dp_reclaim_timer;
+	bool dp_enabled;
+	bool dp_timer_armed;
+	bool dma_vp_ready;
+	u32 dma_vp_id;
+	u32 tx_prod;
+	u32 free_cons;
+	struct sk_buff *slot_skb[RTL_PE_POOL_SLOTS];
+	u16 free_stack[RTL_PE_POOL_SLOTS];
+	u16 free_cnt;
+	u64 dp_tx_enq;
+	u64 dp_tx_bypass;
+
+	/* User-tunable AQM / shaper settings */
+	u32 fq_rate_kbps;
+	u32 fq_target_us;
+	u32 fq_interval_us;
+	u32 fq_quantum;
+	u32 fq_limit;
+	u32 fq_ecn;
+	u32 mcast_rate_kbps;
 };
 
 struct rtl_pe_ctrl {
 	struct device *dev;
 	void __iomem *glb;
+	void __iomem *dma_base;
 	struct clk *pe_clk;
 	struct clk *peaxi_clk;
 	struct mutex lock;
@@ -115,10 +178,27 @@ struct rtl_pe_ctrl {
 
 static struct rtl_pe_ctrl *g_pe_ctrl;
 static struct platform_device *g_fallback_pdev;
+static struct rtl_pe_core __rcu *g_pe_fq_core;
+static struct rtl_pe_core __rcu *g_pe_mcast_core;
 
 static inline struct rtl_pe_shm *pe_shm(struct rtl_pe_core *pe)
 {
 	return pe->mem ? (struct rtl_pe_shm *)((u8 *)pe->mem + RTL_PE_MAILBOX_OFF) : NULL;
+}
+
+static inline struct rtl_pe_tx_desc *pe_tx_ring(struct rtl_pe_core *pe)
+{
+	return pe->mem ? (struct rtl_pe_tx_desc *)((u8 *)pe->mem + RTL_PE_TX_RING_OFF) : NULL;
+}
+
+static inline u32 *pe_free_ring(struct rtl_pe_core *pe)
+{
+	return pe->mem ? (u32 *)((u8 *)pe->mem + RTL_PE_FREE_RING_OFF) : NULL;
+}
+
+static inline struct rtl_pe_dma_desc *pe_dma_ring(struct rtl_pe_core *pe)
+{
+	return pe->mem ? (struct rtl_pe_dma_desc *)((u8 *)pe->mem + RTL_PE_DMA_DESC_OFF) : NULL;
 }
 
 static inline const char *pe_log_buf(struct rtl_pe_core *pe)
@@ -236,10 +316,372 @@ static int rtl_pe_hw_save_once(struct rtl_pe_core *pe)
 	return 0;
 }
 
+static void rtl_pe_drain_skb_list(struct sk_buff_head *q, bool drop)
+{
+	struct sk_buff *skb;
+
+	while ((skb = __skb_dequeue(q)) != NULL) {
+		if (drop)
+			dev_kfree_skb_any(skb);
+		else
+			dev_consume_skb_any(skb);
+	}
+}
+
+static void rtl_pe_reclaim_free_locked(struct rtl_pe_core *pe,
+				       struct sk_buff_head *free_q)
+{
+	struct rtl_pe_shm *shm = pe_shm(pe);
+	u32 *free_ring = pe_free_ring(pe);
+	u32 fprod;
+
+	if (!shm || !free_ring)
+		return;
+
+	fprod = READ_ONCE(shm->free_prod);
+	dma_rmb();
+	while (pe->free_cons != fprod) {
+		u32 sid = READ_ONCE(free_ring[pe->free_cons & RTL_PE_FREE_RING_MASK]);
+
+		pe->free_cons++;
+		if (likely(sid < RTL_PE_POOL_SLOTS)) {
+			if (pe->slot_skb[sid]) {
+				__skb_queue_tail(free_q, pe->slot_skb[sid]);
+				pe->slot_skb[sid] = NULL;
+			}
+			if (likely(pe->free_cnt < RTL_PE_POOL_SLOTS))
+				pe->free_stack[pe->free_cnt++] = (u16)sid;
+		}
+	}
+	WRITE_ONCE(shm->free_cons, pe->free_cons);
+}
+
+static enum hrtimer_restart rtl_pe_reclaim_timer_fn(struct hrtimer *timer)
+{
+	struct rtl_pe_core *pe = container_of(timer, struct rtl_pe_core,
+					      dp_reclaim_timer);
+	struct sk_buff_head free_q;
+	unsigned long flags;
+	bool need_rearm = false;
+
+	__skb_queue_head_init(&free_q);
+	spin_lock_irqsave(&pe->dp_lock, flags);
+	if (READ_ONCE(pe->dp_enabled)) {
+		rtl_pe_reclaim_free_locked(pe, &free_q);
+		need_rearm = (pe->free_cnt < RTL_PE_POOL_SLOTS);
+	}
+	pe->dp_timer_armed = need_rearm;
+	spin_unlock_irqrestore(&pe->dp_lock, flags);
+
+	rtl_pe_drain_skb_list(&free_q, false);
+	if (need_rearm) {
+		hrtimer_forward_now(timer, ns_to_ktime(1500000ULL));
+		return HRTIMER_RESTART;
+	}
+	return HRTIMER_NORESTART;
+}
+
+static void rtl_pe_dp_reset_host_rings(struct rtl_pe_core *pe)
+{
+	struct sk_buff_head drop_q;
+	unsigned long flags;
+	u32 i;
+
+	__skb_queue_head_init(&drop_q);
+	spin_lock_irqsave(&pe->dp_lock, flags);
+	pe->dp_timer_armed = false;
+	pe->tx_prod = 0;
+	pe->free_cons = 0;
+	pe->free_cnt = RTL_PE_POOL_SLOTS;
+	for (i = 0; i < RTL_PE_POOL_SLOTS; i++) {
+		if (pe->slot_skb[i]) {
+			__skb_queue_tail(&drop_q, pe->slot_skb[i]);
+			pe->slot_skb[i] = NULL;
+		}
+		pe->free_stack[i] = (u16)((RTL_PE_POOL_SLOTS - 1U) - i);
+	}
+	if (pe->mem) {
+		struct rtl_pe_shm *shm = pe_shm(pe);
+
+		WRITE_ONCE(shm->tx_prod, 0);
+		WRITE_ONCE(shm->free_cons, 0);
+	}
+	spin_unlock_irqrestore(&pe->dp_lock, flags);
+	rtl_pe_drain_skb_list(&drop_q, true);
+}
+
+static bool rtl_pe_dma_vp_arm_locked(struct rtl_pe_core *pe)
+{
+	void __iomem *dma = pe->ctrl->dma_base;
+	void __iomem *vp;
+	dma_addr_t desc_dma;
+	u32 vp_id = TAURUS_DMA_VP_PE(pe->id);
+	u32 val;
+	int ret;
+
+	pe->dma_vp_id = vp_id;
+	pe->dma_vp_ready = false;
+
+	if (!dma || !pe->mem || !pe->pool || pe->mode != RTL_PE_MODE_OFFLOAD)
+		return false;
+	if (!(readl(dma + TAURUS_DMA_CTRL) & TAURUS_DMA_CTRL_ENABLE))
+		return false;
+
+	vp = dma + TAURUS_DMA_VP(vp_id);
+	desc_dma = pe->dma + RTL_PE_DMA_DESC_OFF;
+
+	writel(0, vp + TAURUS_DMA_VP_ENABLE);
+	writel(0, vp + TAURUS_DMA_VP_IRQ_ENABLE);
+	writel(0, vp + TAURUS_DMA_VP_WRITE);
+	memset(pe_dma_ring(pe), 0,
+	       RTL_PE_DMA_ENTRIES * sizeof(struct rtl_pe_dma_desc));
+	dma_wmb();
+
+	writel(lower_32_bits(desc_dma) | RTL_PE_DMA_ORDER,
+	       vp + TAURUS_DMA_VP_BASE_LOW);
+	writel(TAURUS_DMA_VP_BASE_HIGH_INIT, vp + TAURUS_DMA_VP_BASE_HIGH);
+	writel(TAURUS_DMA_VP_BASE_ACCESS_BUSY | TAURUS_DMA_VP_BASE_ACCESS_WRITE,
+	       vp + TAURUS_DMA_VP_BASE_ACCESS);
+	ret = readl_poll_timeout_atomic(vp + TAURUS_DMA_VP_BASE_ACCESS, val,
+					!(val & TAURUS_DMA_VP_BASE_ACCESS_BUSY),
+					1, 100000);
+	if (ret) {
+		dev_err(pe->ctrl->dev, "pe%u DMA VP%u BASE_ACCESS timeout\n",
+			pe->id, vp_id);
+		return false;
+	}
+
+	writel(TAURUS_DMA_VP_HEADER_A_VAL, vp + TAURUS_DMA_VP_HEADER_A);
+	writel(TAURUS_DMA_VP_ENABLE_ALL, vp + TAURUS_DMA_VP_ENABLE);
+	writel(readl(dma + TAURUS_DMA_SS_CTRL) | TAURUS_DMA_SS_CTRL_EN | BIT(vp_id),
+	       dma + TAURUS_DMA_SS_CTRL);
+	pe->dma_vp_ready = true;
+	return true;
+}
+
+static void rtl_pe_dma_vp_disarm_locked(struct rtl_pe_core *pe)
+{
+	void __iomem *dma = pe->ctrl->dma_base;
+	void __iomem *vp;
+	u32 vp_id = TAURUS_DMA_VP_PE(pe->id);
+	u32 wr, rd;
+
+	if (!dma || !pe->dma_vp_ready) {
+		pe->dma_vp_ready = false;
+		return;
+	}
+
+	pe->dma_vp_ready = false;
+	vp = dma + TAURUS_DMA_VP(vp_id);
+	wr = readl(vp + TAURUS_DMA_VP_WRITE) & RTL_PE_DMA_MASK;
+	readl_poll_timeout(vp + TAURUS_DMA_VP_READ, rd,
+			   (rd & RTL_PE_DMA_MASK) == wr, 50, 10000);
+
+	writel(0, vp + TAURUS_DMA_VP_ENABLE);
+}
+
+static void rtl_pe_update_routes_locked(struct rtl_pe_ctrl *ctrl)
+{
+	struct rtl_pe_core *fq = NULL, *mc = NULL;
+	unsigned int i;
+
+	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
+		struct rtl_pe_core *pe = &ctrl->cores[i];
+
+		if (pe->state != RTL_PE_RUNNING || !pe->dp_enabled ||
+		    !pe->dma_vp_ready || pe->mode != RTL_PE_MODE_OFFLOAD)
+			continue;
+		if (!fq && (pe->feature_mask & RTL_PE_FEAT_FQ_CODEL))
+			fq = pe;
+		if (!mc && (pe->feature_mask & RTL_PE_FEAT_MCAST))
+			mc = pe;
+	}
+
+	rcu_assign_pointer(g_pe_fq_core, fq);
+	rcu_assign_pointer(g_pe_mcast_core, mc);
+}
+
+static int rtl_pe_ni_tx_hook(struct net_device *owner, struct sk_buff *skb,
+			     u32 header_high, u32 header_low,
+			     const u8 *prefix, unsigned int prefix_len,
+			     bool oam)
+{
+	struct sk_buff_head free_q;
+	const struct ethhdr *eth;
+	struct rtl_pe_core *pe;
+	struct rtl_pe_shm *shm;
+	struct rtl_pe_tx_desc *tx_ring;
+	u32 *free_ring;
+	u32 ldpid = (header_low >> 3) & 0x3fU;
+	u32 next_prod, low_val;
+	unsigned int pad_len, wire_len;
+	unsigned long flags;
+	bool is_mcast, is_wan;
+	u64 header_a;
+	u16 feat_id, slot_id;
+	u8 *buf;
+
+	(void)owner;
+
+	if (unlikely(!skb || skb_is_gso(skb) || skb_has_frag_list(skb) ||
+		     skb->ip_summed == CHECKSUM_PARTIAL ||
+		     prefix_len > 64U || ldpid == TAURUS_NI_HDR_OAM_LDPID ||
+		     skb->protocol == htons(ETH_P_SLOW) || skb->len < ETH_HLEN))
+		return -ENOENT;
+
+	pad_len = max_t(unsigned int, skb->len, 60U);
+	wire_len = pad_len + prefix_len;
+	if (unlikely(wire_len + RTL_PE_DMA_HDR_LEN > RTL_PE_SLOT_SIZE))
+		return -ENOENT;
+
+	eth = (const struct ethhdr *)skb->data;
+	is_mcast = is_multicast_ether_addr(eth->h_dest);
+	is_wan = (prefix_len > 0U) || (ldpid >= 32U);
+	if (is_mcast) {
+		pe = rcu_dereference(g_pe_mcast_core);
+		feat_id = RTL_PE_FEAT_MCAST_BIT;
+	} else {
+		pe = rcu_dereference(g_pe_fq_core);
+		feat_id = RTL_PE_FEAT_FQ_CODEL_BIT;
+	}
+	if (!pe)
+		return -ENOENT;
+
+	__skb_queue_head_init(&free_q);
+	spin_lock_irqsave(&pe->dp_lock, flags);
+	shm = pe_shm(pe);
+	tx_ring = pe_tx_ring(pe);
+	free_ring = pe_free_ring(pe);
+	if (unlikely(!READ_ONCE(pe->dp_enabled) || !shm || !tx_ring || !free_ring || !pe->pool)) {
+		spin_unlock_irqrestore(&pe->dp_lock, flags);
+		return -ENOENT;
+	}
+
+	rtl_pe_reclaim_free_locked(pe, &free_q);
+
+	next_prod = (pe->tx_prod + 1U) & RTL_PE_TX_RING_MASK;
+	if (unlikely(!pe->free_cnt || next_prod == READ_ONCE(shm->tx_cons))) {
+		pe->dp_tx_bypass++;
+		spin_unlock_irqrestore(&pe->dp_lock, flags);
+		rtl_pe_drain_skb_list(&free_q, false);
+		return -ENOENT;
+	}
+
+	slot_id = pe->free_stack[--pe->free_cnt];
+	pe->slot_skb[slot_id] = skb;
+	buf = (u8 *)pe->pool + ((size_t)slot_id * RTL_PE_SLOT_SIZE);
+
+	low_val = header_low;
+	if (!(low_val & TAURUS_NI_HDR_PKT_SIZE_MASK))
+		low_val |= (wire_len & 0x3fffU) << 15;
+	header_a = ((u64)low_val << 32) | header_high;
+
+	put_unaligned_le32(0, buf + 0);
+	put_unaligned_le32(wire_len & 0xffffU, buf + 4);
+	put_unaligned_le64(header_a, buf + 8);
+	if (prefix_len)
+		memcpy(buf + RTL_PE_DMA_HDR_LEN, prefix, prefix_len);
+	skb_copy_bits(skb, 0, buf + RTL_PE_DMA_HDR_LEN + prefix_len, skb->len);
+	if (unlikely(pad_len > skb->len))
+		memset(buf + RTL_PE_DMA_HDR_LEN + prefix_len + skb->len, 0,
+		       pad_len - skb->len);
+
+	{
+		struct rtl_pe_tx_desc *td = &tx_ring[pe->tx_prod & RTL_PE_TX_RING_MASK];
+
+		td->slot_id = slot_id;
+		td->wire_len = wire_len;
+		td->hdr_low = low_val;
+		td->hdr_high = header_high;
+		td->desc_ctrl = (oam ? TAURUS_DMA_DESC_CTRL_OAM : TAURUS_DMA_DESC_CTRL) |
+				((wire_len + RTL_PE_DMA_HDR_LEN) << 8);
+		td->feat_id = feat_id;
+		td->prefix_len = (u16)prefix_len;
+		td->flow_hint = skb_get_hash(skb);
+		td->flags = (oam ? RTL_PE_TX_FLAG_OAM : 0U) |
+			    (is_mcast ? RTL_PE_TX_FLAG_MCAST : 0U) |
+			    (is_wan ? RTL_PE_TX_FLAG_WAN : 0U);
+	}
+
+	dma_wmb();
+	pe->tx_prod++;
+	WRITE_ONCE(shm->tx_prod, pe->tx_prod);
+	dma_wmb();
+	pe->dp_tx_enq++;
+
+	if (!pe->dp_timer_armed) {
+		pe->dp_timer_armed = true;
+		hrtimer_start(&pe->dp_reclaim_timer, ns_to_ktime(1500000ULL),
+			      HRTIMER_MODE_REL_SOFT);
+	}
+	spin_unlock_irqrestore(&pe->dp_lock, flags);
+
+	rtl_pe_drain_skb_list(&free_q, false);
+	return 0;
+}
+
+static int rtl_pe_push_dp_reset_locked(struct rtl_pe_core *pe)
+{
+	struct rtl_pe_shm *shm = pe_shm(pe);
+	u32 seq, ack;
+
+	if (pe->state != RTL_PE_RUNNING || !shm)
+		return 0;
+
+	WRITE_ONCE(pe->dp_enabled, false);
+	rtl_pe_update_routes_locked(pe->ctrl);
+	synchronize_rcu();
+	hrtimer_cancel(&pe->dp_reclaim_timer);
+
+	rtl_pe_dp_reset_host_rings(pe);
+	rtl_pe_dma_vp_arm_locked(pe);
+
+	seq = ++pe->dp_seq;
+	WRITE_ONCE(shm->dma_vp_id, pe->dma_vp_id);
+	WRITE_ONCE(shm->dma_vp_ready, pe->dma_vp_ready ? 1U : 0U);
+	WRITE_ONCE(shm->pool_dma, lower_32_bits(pe->pool_dma));
+	WRITE_ONCE(shm->pool_slots, pe->pool ? RTL_PE_POOL_SLOTS : 0U);
+	dma_wmb();
+	WRITE_ONCE(shm->dp_seq, seq);
+	dma_wmb();
+
+	if (read_poll_timeout(READ_ONCE, ack, ack == seq, 100, 50000, false,
+			      shm->dp_ack_seq))
+		dev_warn(pe->ctrl->dev, "pe%u dp_seq ack timeout (%u)\n", pe->id, seq);
+
+	if (pe->dma_vp_ready && pe->mode == RTL_PE_MODE_OFFLOAD)
+		WRITE_ONCE(pe->dp_enabled, true);
+	rtl_pe_update_routes_locked(pe->ctrl);
+	return 0;
+}
+
+static void rtl_pe_on_dma_reset(void)
+{
+	struct rtl_pe_ctrl *ctrl = g_pe_ctrl;
+	unsigned int i;
+
+	if (!ctrl)
+		return;
+
+	mutex_lock(&ctrl->lock);
+	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
+		struct rtl_pe_core *pe = &ctrl->cores[i];
+
+		if (pe->state == RTL_PE_RUNNING && pe->mode == RTL_PE_MODE_OFFLOAD)
+			rtl_pe_push_dp_reset_locked(pe);
+	}
+	mutex_unlock(&ctrl->lock);
+}
+
 static void rtl_pe_hw_stop_locked(struct rtl_pe_core *pe, bool power_down_clk)
 {
 	struct rtl_pe_shm *shm = pe_shm(pe);
 	u32 ack;
+
+	WRITE_ONCE(pe->dp_enabled, false);
+	rtl_pe_update_routes_locked(pe->ctrl);
+	synchronize_rcu();
+	hrtimer_cancel(&pe->dp_reclaim_timer);
 
 	if (pe->state == RTL_PE_RUNNING && shm) {
 		shm->stop_req = 1;
@@ -247,6 +689,9 @@ static void rtl_pe_hw_stop_locked(struct rtl_pe_core *pe, bool power_down_clk)
 		read_poll_timeout(READ_ONCE, ack, ack != 0, 100, 50000, false,
 				  shm->stopped_ack);
 	}
+
+	rtl_pe_dma_vp_disarm_locked(pe);
+	rtl_pe_dp_reset_host_rings(pe);
 
 	if (pe->configured) {
 		rtl_pe_set_reset(pe, TAURUS_RST_PE_BIT(pe->id) | TAURUS_RST_RCPU_BIT(pe->id));
@@ -304,7 +749,7 @@ static bool rtl_pe_fw_name_valid(const char *name)
 static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 {
 	static const u32 atu_in[6]  = { 0x1fc0, 0x1000, 0x1100, 0x1200, 0x1300, 0x0fc0 };
-	static const u32 atu_out[6] = { 0,      0xf430, 0xa040, 0xb040, 0xf700, 0      };
+	static const u32 atu_out_wfo[6] = { 0, 0xf430, 0xa040, 0xb040, 0xf700, 0 };
 	const struct firmware *fw = NULL;
 	struct rtl_pe_shm *shm;
 	u32 mbox_va, pe_hz, peaxi_hz, magic, w0, w1, e0, e1;
@@ -327,14 +772,34 @@ static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 					     &pe->dma, GFP_KERNEL);
 		if (!pe->mem)
 			return -ENOMEM;
-		if (!IS_ALIGNED(pe->dma, RTL_PE_MEM_SIZE) ||
-		    (u64)pe->dma + RTL_PE_MEM_SIZE > 0x20000000ULL) {
-			dev_err(pe->ctrl->dev,
-				"pe%u DMA %pad out of kseg1 512M/128K alignment\n",
+		if (upper_32_bits(pe->dma) || !IS_ALIGNED(pe->dma, RTL_PE_MEM_SIZE)) {
+			dev_err(pe->ctrl->dev, "pe%u DMA %pad invalid 32-bit/128K align\n",
 				pe->id, &pe->dma);
 			dma_free_coherent(pe->ctrl->dev, RTL_PE_MEM_SIZE,
 					  pe->mem, pe->dma);
 			pe->mem = NULL;
+			return -EINVAL;
+		}
+	}
+
+	if (pe->mode == RTL_PE_MODE_WIFI_WFO &&
+	    (u64)pe->dma + RTL_PE_MEM_SIZE > 0x20000000ULL) {
+		dev_err(pe->ctrl->dev, "pe%u WFO DMA %pad exceeds 512M kseg1\n",
+			pe->id, &pe->dma);
+		return -EINVAL;
+	}
+
+	if (pe->mode != RTL_PE_MODE_WIFI_WFO && !pe->pool) {
+		pe->pool = dma_alloc_coherent(pe->ctrl->dev, RTL_PE_POOL_BYTES,
+					      &pe->pool_dma, GFP_KERNEL);
+		if (!pe->pool)
+			return -ENOMEM;
+		if (upper_32_bits(pe->pool_dma) || !IS_ALIGNED(pe->pool_dma, RTL_PE_POOL_BYTES)) {
+			dev_err(pe->ctrl->dev, "pe%u pool DMA %pad invalid align\n",
+				pe->id, &pe->pool_dma);
+			dma_free_coherent(pe->ctrl->dev, RTL_PE_POOL_BYTES,
+					  pe->pool, pe->pool_dma);
+			pe->pool = NULL;
 			return -EINVAL;
 		}
 	}
@@ -371,8 +836,13 @@ static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 	/*
 	 * Patch the 4 mailbox immediate instructions (lui/ori $a0 at 0x00/0x04
 	 * and lui/ori $t0 at 0x380/0x384) with uncached kseg1 mailbox VA.
+	 * Offload mode uses ATU[3] (0xb2000000) so PE works anywhere in 0..1 GiB DRAM.
 	 */
-	mbox_va = (u32)(pe->dma + RTL_PE_MAILBOX_OFF) | 0xa0000000U;
+	if (pe->mode == RTL_PE_MODE_WIFI_WFO)
+		mbox_va = (u32)(pe->dma + RTL_PE_MAILBOX_OFF) | 0xa0000000U;
+	else
+		mbox_va = 0xb2000000U | ((u32)(pe->dma + RTL_PE_MAILBOX_OFF) & 0xfffffU);
+
 	w0 = get_unaligned_le32((u8 *)pe->mem + 0x000) & 0xffff0000U;
 	w1 = get_unaligned_le32((u8 *)pe->mem + 0x004) & 0xffff0000U;
 	e0 = get_unaligned_le32((u8 *)pe->mem + 0x380) & 0xffff0000U;
@@ -382,6 +852,14 @@ static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 	put_unaligned_le32(e0 | (mbox_va >> 16), (u8 *)pe->mem + 0x380);
 	put_unaligned_le32(e1 | (mbox_va & 0xffffU), (u8 *)pe->mem + 0x384);
 
+	rtl_pe_dp_reset_host_rings(pe);
+	if (pe->mode != RTL_PE_MODE_WIFI_WFO)
+		rtl_pe_dma_vp_arm_locked(pe);
+	else {
+		pe->dma_vp_id = 0xffU;
+		pe->dma_vp_ready = false;
+	}
+
 	rtl_pe_read_clks(pe->ctrl, &pe_hz, &peaxi_hz);
 	shm = pe_shm(pe);
 	shm->core_id = pe->id;
@@ -389,22 +867,45 @@ static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 	shm->feature_mask = pe->feature_mask;
 	shm->mode = pe->mode ? pe->mode : RTL_PE_MODE_OFFLOAD;
 	shm->cmd_seq = ++pe->cmd_seq;
+	shm->dp_seq = ++pe->dp_seq;
 	shm->stop_req = 0;
+	shm->dma_vp_id = pe->dma_vp_id;
+	shm->dma_vp_ready = pe->dma_vp_ready ? 1U : 0U;
+	shm->pool_dma = lower_32_bits(pe->pool_dma);
+	shm->pool_slots = pe->pool ? RTL_PE_POOL_SLOTS : 0U;
+	shm->fq_rate_kbps = pe->fq_rate_kbps;
+	shm->fq_target_us = pe->fq_target_us;
+	shm->fq_interval_us = pe->fq_interval_us;
+	shm->fq_quantum = pe->fq_quantum;
+	shm->fq_limit = pe->fq_limit;
+	shm->fq_ecn = pe->fq_ecn;
+	shm->mcast_rate_kbps = pe->mcast_rate_kbps;
 	dma_wmb();
 
 	/* Program all 6 ATU translation windows */
 	for (idx = 0; idx < 6; idx++) {
 		bool is_code = (idx == 0 || idx == 5);
+		u32 out;
+
+		if (is_code)
+			out = (u32)pe->dma >> 16;
+		else if (pe->mode != RTL_PE_MODE_WIFI_WFO && idx == 2)
+			out = ((u32)pe->pool_dma >> 16) & 0xfff0U;
+		else if (pe->mode != RTL_PE_MODE_WIFI_WFO && idx == 3)
+			out = ((u32)pe->dma >> 16) & 0xfff0U;
+		else
+			out = atu_out_wfo[idx];
 
 		writel(atu_in[idx], pe->atu + 4);
 		writel(is_code ? 0xffffU : 0xfff0U, pe->atu + 8);
-		writel(is_code ? ((u32)pe->dma >> 16) : atu_out[idx], pe->atu + 12);
+		writel(out, pe->atu + 12);
 		for (i = 3; i < 7; i++)
 			writel(pe->atu_entries[0][i], pe->atu + 4 + i * 4);
 		ret = rtl_pe_atu_cmd(pe, (pe->atu_staging[0] & 0xff) | 0x3fU |
 				     (idx << 24) | BIT(31));
 		if (ret) {
 			dev_err(pe->ctrl->dev, "pe%u ATU[%u] write timeout\n", pe->id, idx);
+			rtl_pe_dma_vp_disarm_locked(pe);
 			rtl_pe_set_clk_pd(pe, true);
 			return ret;
 		}
@@ -440,11 +941,16 @@ static int rtl_pe_start_locked(struct rtl_pe_core *pe)
 	pe->hb_stalls = 0;
 	pe->last_exc_cause = 0;
 	pe->last_exc_epc = 0;
+	if (pe->dma_vp_ready && pe->mode == RTL_PE_MODE_OFFLOAD)
+		WRITE_ONCE(pe->dp_enabled, true);
+	rtl_pe_update_routes_locked(pe->ctrl);
 
 	dev_info(pe->ctrl->dev,
-		 "pe%u online: fw=%s prid=0x%08x clk=%u MHz axi=%u MHz dma=%pad mask=0x%x\n",
+		 "pe%u online: fw=%s prid=0x%08x clk=%u MHz axi=%u MHz dma=%pad pool=%pad vp=%u(%s) mask=0x%x\n",
 		 pe->id, pe->fw_name, READ_ONCE(shm->cp0_prid),
-		 pe_hz / 1000000U, peaxi_hz / 1000000U, &pe->dma, pe->feature_mask);
+		 pe_hz / 1000000U, peaxi_hz / 1000000U, &pe->dma, &pe->pool_dma,
+		 pe->dma_vp_id, pe->dma_vp_ready ? "ready" : "wait-ni",
+		 pe->feature_mask);
 
 	schedule_delayed_work(&pe->ctrl->wdt_work,
 			      msecs_to_jiffies(RTL_PE_WDT_INTERVAL_MS));
@@ -455,6 +961,7 @@ static int rtl_pe_push_config_locked(struct rtl_pe_core *pe)
 {
 	struct rtl_pe_shm *shm = pe_shm(pe);
 	u32 seq, ack;
+	int ret;
 
 	if (pe->state != RTL_PE_RUNNING || !shm)
 		return 0;
@@ -462,12 +969,21 @@ static int rtl_pe_push_config_locked(struct rtl_pe_core *pe)
 	seq = ++pe->cmd_seq;
 	shm->feature_mask = pe->feature_mask;
 	shm->mode = pe->mode;
+	shm->fq_rate_kbps = pe->fq_rate_kbps;
+	shm->fq_target_us = pe->fq_target_us;
+	shm->fq_interval_us = pe->fq_interval_us;
+	shm->fq_quantum = pe->fq_quantum;
+	shm->fq_limit = pe->fq_limit;
+	shm->fq_ecn = pe->fq_ecn;
+	shm->mcast_rate_kbps = pe->mcast_rate_kbps;
 	dma_wmb();
 	shm->cmd_seq = seq;
 	dma_wmb();
 
-	return read_poll_timeout(READ_ONCE, ack, ack == seq, 100, 50000, false,
-				 shm->ack_seq);
+	ret = read_poll_timeout(READ_ONCE, ack, ack == seq, 100, 50000, false,
+				shm->ack_seq);
+	rtl_pe_update_routes_locked(pe->ctrl);
+	return ret;
 }
 
 static void rtl_pe_wdt_fn(struct work_struct *work)
@@ -728,6 +1244,17 @@ static ssize_t stats_show(struct rtl_pe_core *pe, char *buf)
 	len += sysfs_emit_at(buf, len, "clk_gated=%u\n", pe->clk_gated ? 1U : 0U);
 	len += sysfs_emit_at(buf, len, "exc_cause=0x%08x\n", pe->last_exc_cause);
 	len += sysfs_emit_at(buf, len, "exc_epc=0x%08x\n", pe->last_exc_epc);
+	len += sysfs_emit_at(buf, len, "dma_vp_id=%u\n", pe->dma_vp_id);
+	len += sysfs_emit_at(buf, len, "dma_vp_ready=%u\n", pe->dma_vp_ready ? 1U : 0U);
+	len += sysfs_emit_at(buf, len, "dp_enq=%llu\n", pe->dp_tx_enq);
+	len += sysfs_emit_at(buf, len, "dp_bypass=%llu\n", pe->dp_tx_bypass);
+	len += sysfs_emit_at(buf, len, "fq_rate_kbps=%u\n", pe->fq_rate_kbps);
+	len += sysfs_emit_at(buf, len, "fq_target_us=%u\n", pe->fq_target_us);
+	len += sysfs_emit_at(buf, len, "fq_interval_us=%u\n", pe->fq_interval_us);
+	len += sysfs_emit_at(buf, len, "fq_quantum=%u\n", pe->fq_quantum);
+	len += sysfs_emit_at(buf, len, "fq_limit=%u\n", pe->fq_limit);
+	len += sysfs_emit_at(buf, len, "fq_ecn=%u\n", pe->fq_ecn);
+	len += sysfs_emit_at(buf, len, "mcast_rate_kbps=%u\n", pe->mcast_rate_kbps);
 
 	if (shm && pe->state == RTL_PE_RUNNING) {
 		dma_rmb();
@@ -743,19 +1270,23 @@ static ssize_t stats_show(struct rtl_pe_core *pe, char *buf)
 		len += sysfs_emit_at(buf, len, "window_cycles=%u\n", READ_ONCE(shm->window_cycles));
 		len += sysfs_emit_at(buf, len, "busy_cycles=%u\n", READ_ONCE(shm->busy_cycles));
 		len += sysfs_emit_at(buf, len, "util_permille=%u\n", READ_ONCE(shm->util_permille));
+		len += sysfs_emit_at(buf, len, "dma_tx_head=%u\n", READ_ONCE(shm->dma_tx_head));
+		len += sysfs_emit_at(buf, len, "dma_tx_tail=%u\n", READ_ONCE(shm->dma_tx_tail));
 		len += sysfs_emit_at(buf, len, "test_crc=0x%08x\n", READ_ONCE(shm->test_crc));
 		len += sysfs_emit_at(buf, len, "test_cycles=%u\n", READ_ONCE(shm->test_cycles));
 
 		for (i = 0; i < RTL_PE_FEAT_MAX; i++) {
 			len += sysfs_emit_at(buf, len,
-					     "feat%u=%u %u %llu %llu %u 0x%x\n",
+					     "feat%u=%u %u %llu %llu %u 0x%x %llu %llu\n",
 					     i,
 					     READ_ONCE(shm->feat[i].util_permille),
 					     READ_ONCE(shm->feat[i].cycles),
 					     READ_ONCE(shm->feat[i].packets),
 					     READ_ONCE(shm->feat[i].bytes),
 					     READ_ONCE(shm->feat[i].qdepth),
-					     READ_ONCE(shm->feat[i].flags));
+					     READ_ONCE(shm->feat[i].flags),
+					     READ_ONCE(shm->feat[i].drops),
+					     READ_ONCE(shm->feat[i].ecn_marks));
 		}
 	} else {
 		len += sysfs_emit_at(buf, len, "util_permille=0\n");
@@ -887,6 +1418,36 @@ static ssize_t selftest_store(struct rtl_pe_core *pe, const char *buf, size_t co
 		.store = _name##_store, \
 	}
 
+#define PE_U32_ATTR(_name, _field, _min, _max) \
+static ssize_t _name##_show(struct rtl_pe_core *pe, char *buf) \
+{ \
+	ssize_t n; \
+	mutex_lock(&pe->ctrl->lock); \
+	n = sysfs_emit(buf, "%u\n", pe->_field); \
+	mutex_unlock(&pe->ctrl->lock); \
+	return n; \
+} \
+static ssize_t _name##_store(struct rtl_pe_core *pe, const char *buf, size_t count) \
+{ \
+	u32 v; \
+	int ret = kstrtou32(buf, 0, &v); \
+	if (ret) \
+		return ret; \
+	if (v < (_min) || v > (_max)) \
+		return -EINVAL; \
+	mutex_lock(&pe->ctrl->lock); \
+	if (pe->_field == v) { \
+		mutex_unlock(&pe->ctrl->lock); \
+		return count; \
+	} \
+	pe->_field = v; \
+	if (pe->state == RTL_PE_RUNNING) \
+		ret = rtl_pe_push_config_locked(pe); \
+	mutex_unlock(&pe->ctrl->lock); \
+	return ret ? ret : count; \
+} \
+PE_ATTR_RW(_name)
+
 PE_ATTR_RO(state);
 PE_ATTR_RW(enable);
 PE_ATTR_RW(mode);
@@ -895,6 +1456,13 @@ PE_ATTR_RW(feature_mask);
 PE_ATTR_RO(stats);
 PE_ATTR_RO(log);
 PE_ATTR_WO(selftest);
+PE_U32_ATTR(fq_rate_kbps, fq_rate_kbps, 0U, 10000000U);
+PE_U32_ATTR(fq_target_us, fq_target_us, 100U, 100000U);
+PE_U32_ATTR(fq_interval_us, fq_interval_us, 1000U, 400000U);
+PE_U32_ATTR(fq_quantum, fq_quantum, 256U, 9000U);
+PE_U32_ATTR(fq_limit, fq_limit, 16U, 224U);
+PE_U32_ATTR(fq_ecn, fq_ecn, 0U, 1U);
+PE_U32_ATTR(mcast_rate_kbps, mcast_rate_kbps, 0U, 10000000U);
 
 static struct attribute *pe_core_attrs[] = {
 	&pe_attr_state.attr,
@@ -905,6 +1473,13 @@ static struct attribute *pe_core_attrs[] = {
 	&pe_attr_stats.attr,
 	&pe_attr_log.attr,
 	&pe_attr_selftest.attr,
+	&pe_attr_fq_rate_kbps.attr,
+	&pe_attr_fq_target_us.attr,
+	&pe_attr_fq_interval_us.attr,
+	&pe_attr_fq_quantum.attr,
+	&pe_attr_fq_limit.attr,
+	&pe_attr_fq_ecn.attr,
+	&pe_attr_mcast_rate_kbps.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(pe_core);
@@ -952,6 +1527,7 @@ static void rtl_pe_quiesce_all(struct rtl_pe_ctrl *ctrl)
 {
 	unsigned int i;
 
+	rtl9617c_ni_unregister_tx_hook(rtl_pe_ni_tx_hook);
 	cancel_delayed_work_sync(&ctrl->wdt_work);
 	mutex_lock(&ctrl->lock);
 	for (i = 0; i < RTL_PE_NUM_CORES; i++)
@@ -988,8 +1564,10 @@ static int rtl_pe_probe(struct platform_device *pdev)
 		return ret;
 
 	ctrl->glb = devm_ioremap(&pdev->dev, TAURUS_GLB_BASE, TAURUS_GLB_SIZE);
+	ctrl->dma_base = devm_ioremap(&pdev->dev, TAURUS_DMA_LSO_BASE,
+				      TAURUS_DMA_LSO_SIZE);
 	sram_base = devm_ioremap(&pdev->dev, TAURUS_SRAM_BASE, TAURUS_SRAM_SIZE);
-	if (!ctrl->glb || !sram_base)
+	if (!ctrl->glb || !ctrl->dma_base || !sram_base)
 		return -ENOMEM;
 
 	ctrl->pe_clk = devm_clk_get_optional(&pdev->dev, "pe");
@@ -1014,6 +1592,15 @@ static int rtl_pe_probe(struct platform_device *pdev)
 		pe->id = i;
 		pe->state = RTL_PE_STOPPED;
 		pe->mode = RTL_PE_MODE_OFF;
+		pe->dma_vp_id = 0xffU;
+		spin_lock_init(&pe->dp_lock);
+		hrtimer_setup(&pe->dp_reclaim_timer, rtl_pe_reclaim_timer_fn,
+			      CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
+		pe->fq_target_us = 5000U;
+		pe->fq_interval_us = 100000U;
+		pe->fq_quantum = 1514U;
+		pe->fq_limit = 224U;
+		pe->fq_ecn = 1U;
 		strscpy(pe->fw_name, RTL_PE_DEFAULT_FW, sizeof(pe->fw_name));
 
 		pe->atu = devm_ioremap(&pdev->dev,
@@ -1041,11 +1628,21 @@ static int rtl_pe_probe(struct platform_device *pdev)
 	g_pe_ctrl = ctrl;
 	platform_set_drvdata(pdev, ctrl);
 
+	ret = rtl9617c_ni_register_tx_hook(rtl_pe_ni_tx_hook, rtl_pe_on_dma_reset);
+	if (ret) {
+		dev_err(&pdev->dev, "failed to register NI TX hook: %d\n", ret);
+		goto err_hook;
+	}
+
 	rtl_pe_read_clks(ctrl, &pe_hz, &peaxi_hz);
-	dev_info(&pdev->dev, "RTL9617C dual Taroko MIPS32 PE base ready (PE %u MHz, AXI %u MHz)\n",
+	dev_info(&pdev->dev, "RTL9617C dual Taroko MIPS32 PE data-plane driver ready (PE %u MHz, AXI %u MHz)\n",
 		 pe_hz / 1000000U, peaxi_hz / 1000000U);
 	return 0;
 
+err_hook:
+	g_pe_ctrl = NULL;
+	unregister_reboot_notifier(&ctrl->reboot_nb);
+	i = RTL_PE_NUM_CORES;
 err_cores:
 	while (i--)
 		kobject_put(&ctrl->cores[i].kobj);
@@ -1060,12 +1657,18 @@ static void rtl_pe_remove(struct platform_device *pdev)
 	struct rtl_pe_ctrl *ctrl = platform_get_drvdata(pdev);
 	unsigned int i;
 
+	rtl9617c_ni_unregister_tx_hook(rtl_pe_ni_tx_hook);
 	unregister_reboot_notifier(&ctrl->reboot_nb);
 	rtl_pe_quiesce_all(ctrl);
 	g_pe_ctrl = NULL;
 
 	for (i = 0; i < RTL_PE_NUM_CORES; i++) {
 		kobject_put(&ctrl->cores[i].kobj);
+		if (ctrl->cores[i].pool) {
+			dma_free_coherent(ctrl->dev, RTL_PE_POOL_BYTES,
+					  ctrl->cores[i].pool, ctrl->cores[i].pool_dma);
+			ctrl->cores[i].pool = NULL;
+		}
 		if (ctrl->cores[i].mem) {
 			dma_free_coherent(ctrl->dev, RTL_PE_MEM_SIZE,
 					  ctrl->cores[i].mem, ctrl->cores[i].dma);
