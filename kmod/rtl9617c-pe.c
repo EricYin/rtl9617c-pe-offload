@@ -39,7 +39,9 @@
 #include <linux/workqueue.h>
 
 #include <linux/soc/realtek/rtl9617c-pe-abi.h>
+#ifdef RTL9617C_PE_HAS_NI_TX_HOOK
 #include "rtl9617c_ni.h"
+#endif
 
 #define RTL_PE_NUM_CORES		2
 #define RTL_PE_DEFAULT_FW		"rtl9617c/pe-offload.bin"
@@ -521,6 +523,7 @@ static void rtl_pe_update_routes_locked(struct rtl_pe_ctrl *ctrl)
 	rcu_assign_pointer(g_pe_mcast_core, mc);
 }
 
+#ifdef RTL9617C_PE_HAS_NI_TX_HOOK
 static int rtl_pe_ni_tx_hook(struct net_device *owner, struct sk_buff *skb,
 			     u32 header_high, u32 header_low,
 			     const u8 *prefix, unsigned int prefix_len,
@@ -692,6 +695,30 @@ static void rtl_pe_on_dma_reset(void)
 	}
 	mutex_unlock(&ctrl->lock);
 }
+
+static inline int rtl_pe_attach_ni_hook(struct device *dev)
+{
+	int ret = rtl9617c_ni_register_tx_hook(rtl_pe_ni_tx_hook,
+					       rtl_pe_on_dma_reset);
+
+	if (ret)
+		dev_err(dev, "failed to register NI TX hook: %d\n", ret);
+	return ret;
+}
+
+static inline void rtl_pe_detach_ni_hook(void)
+{
+	rtl9617c_ni_unregister_tx_hook(rtl_pe_ni_tx_hook);
+}
+#else
+static inline int rtl_pe_attach_ni_hook(struct device *dev)
+{
+	dev_warn(dev, "NI TX hook unavailable in kernel tree; PE datapath TX offload inactive\n");
+	return 0;
+}
+
+static inline void rtl_pe_detach_ni_hook(void) { }
+#endif
 
 static void rtl_pe_hw_stop_locked(struct rtl_pe_core *pe, bool power_down_clk)
 {
@@ -1547,7 +1574,7 @@ static void rtl_pe_quiesce_all(struct rtl_pe_ctrl *ctrl)
 {
 	unsigned int i;
 
-	rtl9617c_ni_unregister_tx_hook(rtl_pe_ni_tx_hook);
+	rtl_pe_detach_ni_hook();
 	cancel_delayed_work_sync(&ctrl->wdt_work);
 	mutex_lock(&ctrl->lock);
 	for (i = 0; i < RTL_PE_NUM_CORES; i++)
@@ -1648,11 +1675,9 @@ static int rtl_pe_probe(struct platform_device *pdev)
 	g_pe_ctrl = ctrl;
 	platform_set_drvdata(pdev, ctrl);
 
-	ret = rtl9617c_ni_register_tx_hook(rtl_pe_ni_tx_hook, rtl_pe_on_dma_reset);
-	if (ret) {
-		dev_err(&pdev->dev, "failed to register NI TX hook: %d\n", ret);
+	ret = rtl_pe_attach_ni_hook(&pdev->dev);
+	if (ret)
 		goto err_hook;
-	}
 
 	rtl_pe_read_clks(ctrl, &pe_hz, &peaxi_hz);
 	dev_info(&pdev->dev, "RTL9617C dual Taroko MIPS32 PE data-plane driver ready (PE %u MHz, AXI %u MHz)\n",
@@ -1677,7 +1702,7 @@ static void rtl_pe_remove(struct platform_device *pdev)
 	struct rtl_pe_ctrl *ctrl = platform_get_drvdata(pdev);
 	unsigned int i;
 
-	rtl9617c_ni_unregister_tx_hook(rtl_pe_ni_tx_hook);
+	rtl_pe_detach_ni_hook();
 	unregister_reboot_notifier(&ctrl->reboot_nb);
 	rtl_pe_quiesce_all(ctrl);
 	g_pe_ctrl = NULL;

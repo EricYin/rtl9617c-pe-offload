@@ -12,46 +12,46 @@ export const FEATURES = [
 	{
 		id: 'fq_codel',
 		bit: 0,
-		name: 'FQ-CoDel 硬件公平队列',
-		desc: '在 PE 旁路运行 64 队列 FQ-CoDel（支持 1ns PTP 定时整形与 ECN 标记），消除上行/代理路径缓冲膨胀',
-		module_title: '网口总限速与排队',
+		name: 'Hardware FQ-CoDel Fair Queueing',
+		desc: 'Runs 64-queue FQ-CoDel in PE bypass (with 1ns PTP-timed shaping and ECN marking) to eliminate uplink/proxy bufferbloat',
+		module_title: 'Port Shaping & Queueing',
 		module_url: 'admin/network/rtl9617c_qos/ports',
 		default_pe: 0,
 		hw_capable: true,
-		note: '已接入 NI TX 钩子与 DMA LSO VP 直发引擎，可与其他有线卸载同核共存'
+		note: 'Hooked into NI TX and DMA LSO VP direct-transmit engine; coexists with other wired offloads on the same core'
 	},
 	{
 		id: 'ipsec',
 		bit: 1,
-		name: 'IPsec ESP 卸载框架',
-		desc: '框架保留；当前 0x90500000 密码引擎由内核 rtk-taurus-crypto 管理，加解密由 ARMv8 AES-CE 承担',
-		module_title: 'VPN 硬件加速',
+		name: 'IPsec ESP Offload Framework',
+		desc: 'Framework reserved; the 0x90500000 crypto engine is managed by kernel rtk-taurus-crypto and encryption runs on ARMv8 AES-CE',
+		module_title: 'VPN Hardware Offload',
 		module_url: 'admin/network/rtl9617c_vpn',
 		default_pe: 0,
 		hw_capable: false,
-		note: '仅状态占位（实机密码由内核 ARMv8 AES-CE 执行，未绑定 PE DMA TX 路径）'
+		note: 'Status placeholder only (crypto runs on kernel ARMv8 AES-CE, not bound to PE DMA TX path)'
 	},
 	{
 		id: 'srv6',
 		bit: 2,
-		name: 'SRv6 / 变长隧道头框架',
-		desc: '框架保留；当前变长 SRv6 封装由内核网络栈与 FE 表项协同承担',
-		module_title: 'VPN 硬件加速',
+		name: 'SRv6 / Variable Tunnel Header Framework',
+		desc: 'Framework reserved; variable-length SRv6 encapsulation is handled by the kernel network stack and FE flow entries',
+		module_title: 'VPN Hardware Offload',
 		module_url: 'admin/network/rtl9617c_vpn',
 		default_pe: 1,
 		hw_capable: false,
-		note: '仅状态占位（当前未绑定 PE DMA TX 路径）'
+		note: 'Status placeholder only (not currently bound to PE DMA TX path)'
 	},
 	{
 		id: 'mcast',
 		bit: 3,
-		name: '组播队列硬件直发',
-		desc: '接管主机侧发送的组播/广播报文，经 PE 与独立 DMA LSO VP 发送并支持可选速率平滑',
-		module_title: '硬件加速与卸载',
+		name: 'Hardware Multicast Queue Offload',
+		desc: 'Takes over host-originated multicast/broadcast packets via PE and a dedicated DMA LSO VP with optional rate pacing',
+		module_title: 'Hardware Offload',
 		module_url: 'admin/network/rtl9617c_offload',
 		default_pe: 1,
 		hw_capable: true,
-		note: '已接入 NI TX 钩子与 DMA LSO VP 直发引擎，可与其他有线卸载同核共存'
+		note: 'Hooked into NI TX and DMA LSO VP direct-transmit engine; coexists with other wired offloads on the same core'
 	}
 ];
 
